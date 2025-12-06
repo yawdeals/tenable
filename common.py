@@ -178,7 +178,7 @@ class CriblHECHandler:
         if not events:
             return 0
 
-        success_count = 0
+        buffered_count = 0
         batch_sourcetype = sourcetype or self.sourcetype
 
         # Add each event to the batch buffer
@@ -199,22 +199,44 @@ class CriblHECHandler:
                     }
 
                 self.hec_handler.sendEvent(payload)
-                success_count += 1
+                buffered_count += 1
             except Exception as e:
                 logging.error("Failed to add event to batch: {0}".format(e))
 
         # Flush the batch to send all buffered events
         try:
-            self.hec_handler.flushBatch()
-            logging.info(
-                "HEC batch sent: {0} events | feed_type={1} | feed_name={2}".format(
-                    success_count,
-                    feed_type or 'n/a',
-                    feed_name or 'n/a'))
+            response = self.hec_handler.flushBatch()
+            # Check if flush actually succeeded
+            # response can be: Response object (success/error), None (empty batch), or False (all retries failed)
+            if response is False:
+                # All retries exhausted
+                logging.error(
+                    "HEC batch failed after all retries | buffered={0} events".format(buffered_count))
+                return 0
+            elif response is None:
+                # Empty batch or already flushed - this is OK
+                logging.debug("HEC batch was empty or already flushed")
+                return buffered_count
+            elif hasattr(response, 'status_code'):
+                if response.status_code == 200:
+                    logging.info(
+                        "HEC batch sent: {0} events | feed_type={1} | feed_name={2}".format(
+                            buffered_count,
+                            feed_type or 'n/a',
+                            feed_name or 'n/a'))
+                    return buffered_count
+                else:
+                    logging.error(
+                        "HEC batch failed: status={0} | buffered={1} events".format(
+                            response.status_code, buffered_count))
+                    return 0
+            else:
+                # Unexpected response type
+                logging.error("HEC batch returned unexpected response: {0}".format(response))
+                return 0
         except Exception as e:
             logging.error("Error flushing batch: {0}".format(e))
-
-        return success_count
+            return 0
 
     def flush(self):
         """Flush any pending events in the HEC buffer."""
