@@ -297,6 +297,8 @@ class http_event_collector:
         # Reset batch to prevent stuck state
         self.batchEvents = []
         self.currentByteLength = 0
+        # Return False to indicate failure (no response object)
+        return False
 
     def __del__(self):
         """
