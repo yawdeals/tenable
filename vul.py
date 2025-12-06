@@ -6,6 +6,25 @@ from feeds.base import BaseFeedProcessor
 from feeds.assets import _safe_export_with_retry
 
 
+def _safe_get(obj, key, default=None):
+    """Safely get a value from a dict or Box object."""
+    if obj is None:
+        return default
+    if hasattr(obj, 'get'):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _safe_nested_get(obj, *keys, default=None):
+    """Safely get a nested value from a dict or Box object chain."""
+    current = obj
+    for key in keys:
+        current = _safe_get(current, key)
+        if current is None:
+            return default
+    return current if current is not None else default
+
+
 class VulnerabilityFeedProcessor(BaseFeedProcessor):
 
     def __init__(self, tenable_client, checkpoint_mgr,
@@ -40,11 +59,12 @@ class VulnerabilityFeedProcessor(BaseFeedProcessor):
                         'high',
                         'critical']),
                     "Active Vulnerabilities"):
+                # Use safe helpers for pytenable 1.9.0+ Box object compatibility
                 vuln_key = "{0}_{1}_{2}_{3}".format(
-                    vuln.get('asset', {}).get('uuid', 'unknown'),
-                    vuln.get('plugin', {}).get('id', 'unknown'),
-                    vuln.get('port', {}).get('port', '0'),
-                    vuln.get('port', {}).get('protocol', 'tcp')
+                    _safe_nested_get(vuln, 'asset', 'uuid', default='unknown'),
+                    _safe_nested_get(vuln, 'plugin', 'id', default='unknown'),
+                    _safe_nested_get(vuln, 'port', 'port', default='0'),
+                    _safe_nested_get(vuln, 'port', 'protocol', default='tcp')
                 )
 
                 if self.is_processed(vuln_key):
@@ -95,11 +115,12 @@ class VulnerabilityNoInfoProcessor(BaseFeedProcessor):
                 lambda: self.tenable.exports.vulns(severity=['info']),
                 "Informational Vulnerabilities"
             ):
+                # Use safe helpers for pytenable 1.9.0+ Box object compatibility
                 vuln_key = "{0}_{1}_{2}_{3}".format(
-                    vuln.get('asset', {}).get('uuid', 'unknown'),
-                    vuln.get('plugin', {}).get('id', 'unknown'),
-                    vuln.get('port', {}).get('port', '0'),
-                    vuln.get('port', {}).get('protocol', 'tcp')
+                    _safe_nested_get(vuln, 'asset', 'uuid', default='unknown'),
+                    _safe_nested_get(vuln, 'plugin', 'id', default='unknown'),
+                    _safe_nested_get(vuln, 'port', 'port', default='0'),
+                    _safe_nested_get(vuln, 'port', 'protocol', default='tcp')
                 )
 
                 if self.is_processed(vuln_key):
@@ -153,15 +174,16 @@ class VulnerabilitySelfScanProcessor(BaseFeedProcessor):
                 lambda: self.tenable.exports.vulns(state=['OPEN']),
                 "Agent-Based Vulnerabilities"
             ):
-                asset_info = vuln.get('asset', {})
-                if not asset_info.get('has_agent', False):
+                # Use safe helpers for pytenable 1.9.0+ Box object compatibility
+                asset_info = _safe_get(vuln, 'asset', {})
+                if not _safe_get(asset_info, 'has_agent', False):
                     continue
 
                 vuln_key = "{0}_{1}_{2}_{3}".format(
-                    asset_info.get('uuid', 'unknown'),
-                    vuln.get('plugin', {}).get('id', 'unknown'),
-                    vuln.get('port', {}).get('port', '0'),
-                    vuln.get('port', {}).get('protocol', 'tcp')
+                    _safe_get(asset_info, 'uuid', 'unknown'),
+                    _safe_nested_get(vuln, 'plugin', 'id', default='unknown'),
+                    _safe_nested_get(vuln, 'port', 'port', default='0'),
+                    _safe_nested_get(vuln, 'port', 'protocol', default='tcp')
                 )
 
                 if self.is_processed(vuln_key):
@@ -222,11 +244,12 @@ class FixedVulnerabilityProcessor(BaseFeedProcessor):
                 lambda: self.tenable.exports.vulns(state=['FIXED']),
                 "Fixed Vulnerabilities"
             ):
+                # Use safe helpers for pytenable 1.9.0+ Box object compatibility
                 vuln_key = "{0}_{1}_{2}_{3}".format(
-                    vuln.get('asset', {}).get('uuid', 'unknown'),
-                    vuln.get('plugin', {}).get('id', 'unknown'),
-                    vuln.get('port', {}).get('port', '0'),
-                    vuln.get('port', {}).get('protocol', 'tcp')
+                    _safe_nested_get(vuln, 'asset', 'uuid', default='unknown'),
+                    _safe_nested_get(vuln, 'plugin', 'id', default='unknown'),
+                    _safe_nested_get(vuln, 'port', 'port', default='0'),
+                    _safe_nested_get(vuln, 'port', 'protocol', default='tcp')
                 )
                 current_vulns.add(vuln_key)
 
