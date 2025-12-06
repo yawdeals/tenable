@@ -118,7 +118,13 @@ class TenableIntegration:
 
         # Smart feed grouping enabled by default (avoids 429 errors)
         self.smart_grouping = os.getenv('SMART_FEED_GROUPING', 'true').lower() == 'true'
-        if self.smart_grouping:
+        
+        # Fully sequential mode - no parallelism at all (safest for 429 prevention)
+        self.fully_sequential = os.getenv('FULLY_SEQUENTIAL', 'false').lower() == 'true'
+        if self.fully_sequential:
+            self.logger.info("FULLY SEQUENTIAL MODE: All feeds run one at a time (safest)")
+            self.smart_grouping = False  # Override smart grouping
+        elif self.smart_grouping:
             self.logger.info("Smart feed grouping: ENABLED (avoids Tenable API conflicts)")
 
         # Cache for feed processors (lazy initialization)
@@ -200,6 +206,41 @@ class TenableIntegration:
                     feed_name, str(e)), exc_info=True)
             return 0
 
+    def _run_fully_sequential(self, feeds_to_process):
+        """Run ALL feeds one at a time with delays - safest for 429 prevention."""
+        total_events = 0
+        feed_results = {}
+        inter_feed_delay = int(os.getenv('INTER_FEED_DELAY', 30))
+
+        self.logger.info("=" * 60)
+        self.logger.info("FULLY SEQUENTIAL MODE: No parallelism")
+        self.logger.info("Processing {0} feeds one at a time".format(len(feeds_to_process)))
+        self.logger.info("Inter-feed delay: {0} seconds".format(inter_feed_delay))
+        self.logger.info("=" * 60)
+
+        for i, feed_name in enumerate(feeds_to_process):
+            if self._shutdown_event.is_set():
+                break
+
+            self.logger.info("Processing feed {0}/{1}: {2}".format(
+                i + 1, len(feeds_to_process), feed_name))
+            
+            try:
+                event_count = self._process_feed(feed_name)
+                total_events += event_count
+                feed_results[feed_name] = event_count
+                self.logger.info("Completed {0}: {1} events".format(feed_name, event_count))
+            except Exception as e:
+                self.logger.error("Feed {0} FAILED: {1}".format(feed_name, str(e)))
+                feed_results[feed_name] = 0
+
+            # Wait between feeds to let Tenable release any locks
+            if i < len(feeds_to_process) - 1 and inter_feed_delay > 0:
+                self.logger.info("Waiting {0}s before next feed...".format(inter_feed_delay))
+                time.sleep(inter_feed_delay)
+
+        return total_events, feed_results
+
     def _run_simple(self, feeds_to_process):
         """Run feeds with simple concurrent/sequential processing (original behavior)."""
         total_events = 0
@@ -269,11 +310,14 @@ class TenableIntegration:
             self.logger.info("  {0}: {1}".format(group_name, ', '.join(feeds)))
         self.logger.info("=" * 60)
 
+        # Delay between feeds in same group (seconds) to let Tenable release export lock
+        inter_feed_delay = int(os.getenv('INTER_FEED_DELAY', 30))
+
         def process_group_sequentially(group_name, feeds):
             """Process all feeds in a group one at a time."""
             group_events = 0
             group_results = {}
-            for feed in feeds:
+            for i, feed in enumerate(feeds):
                 if self._shutdown_event.is_set():
                     break
                 self.logger.info("[{0}] Processing: {1}".format(group_name, feed))
@@ -282,6 +326,11 @@ class TenableIntegration:
                 group_results[feed] = event_count
                 self.logger.info("[{0}] Completed: {1} ({2} events)".format(
                     group_name, feed, event_count))
+                # Wait between feeds in same group to let Tenable release export lock
+                if i < len(feeds) - 1 and inter_feed_delay > 0:
+                    self.logger.info("[{0}] Waiting {1}s before next feed...".format(
+                        group_name, inter_feed_delay))
+                    time.sleep(inter_feed_delay)
             return group_events, group_results
 
         # Run groups in parallel, but feeds within each group run sequentially
@@ -344,8 +393,12 @@ class TenableIntegration:
             total_events = 0
             feed_results = {}
 
-            # Use smart grouping to avoid Tenable API conflicts (429 errors)
-            if self.smart_grouping and len(feeds_to_process) > 1:
+            # Choose execution mode based on settings
+            if self.fully_sequential:
+                # Safest: No parallelism at all
+                total_events, feed_results = self._run_fully_sequential(feeds_to_process)
+            elif self.smart_grouping and len(feeds_to_process) > 1:
+                # Smart: Groups run in parallel, feeds within group run sequentially
                 total_events, feed_results = self._run_with_smart_grouping(feeds_to_process)
             else:
                 # Original behavior: simple concurrent/sequential processing
