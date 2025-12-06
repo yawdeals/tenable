@@ -159,7 +159,8 @@ class FileCheckpoint:
         with self._lock:
             self._load_checkpoint(key)
             # Return 0 if no timestamp exists to allow numeric comparisons
-            return self._cache[key].get('last_timestamp', 0)
+            # Use 'or 0' because the cache default may contain None
+            return self._cache[key].get('last_timestamp') or 0
 
     def set_last_timestamp(self, key, timestamp):
         with self._lock:
