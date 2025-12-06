@@ -75,8 +75,10 @@ class TenableIntegration:
             ssl_ca_cert=ca_cert_path,
             max_retries=int(os.getenv('HEC_MAX_RETRIES', 3)),
             backoff_factor=float(os.getenv('HEC_BACKOFF_FACTOR', 1.0)),
-            pool_connections=int(os.getenv('HEC_POOL_CONNECTIONS', 10)),
-            pool_maxsize=int(os.getenv('HEC_POOL_MAXSIZE', 10))
+            pool_connections=int(os.getenv('HEC_POOL_CONNECTIONS', 3)),
+            pool_maxsize=int(os.getenv('HEC_POOL_MAXSIZE', 3)),
+            batch_delay=float(os.getenv('HEC_BATCH_DELAY', 0.2)),
+            request_timeout=int(os.getenv('HEC_REQUEST_TIMEOUT', 90))
         )
 
         # Initialize checkpoint manager for deduplication
@@ -88,8 +90,8 @@ class TenableIntegration:
         )
         self.logger.info("Initialized file-based checkpointing")
 
-        # Configure batch size for HEC sends
-        self.batch_size = int(os.getenv('HEC_BATCH_SIZE', 10000))
+        # Configure batch size for HEC sends (5000 recommended for stability)
+        self.batch_size = int(os.getenv('HEC_BATCH_SIZE', 5000))
         self.logger.info(
             "Batch size configured: {0} events".format(
                 self.batch_size))
@@ -103,15 +105,16 @@ class TenableIntegration:
         else:
             self.logger.info("Max events per feed: unlimited")
 
-        # Configure concurrent workers (0 = auto-tune, 1+ = explicit)
-        self.max_workers = int(os.getenv('MAX_CONCURRENT_FEEDS', 0))
-        # Note: if 0, will auto-tune to min(10, feed_count) at runtime
+        # Configure concurrent workers (1 = sequential/safest, 2-3 = moderate)
+        # Sequential processing is recommended to avoid overwhelming HEC
+        self.max_workers = int(os.getenv('MAX_CONCURRENT_FEEDS', 1))
+        # Note: if 0, will auto-tune to min(3, feed_count) at runtime
         if self.max_workers > 0:
             self.logger.info(
-                "Concurrent execution: {0} workers (explicit)".format(
+                "Concurrent execution: {0} workers".format(
                     self.max_workers))
         else:
-            self.logger.info("Concurrent execution: auto-tune (up to 10 workers)")
+            self.logger.info("Concurrent execution: auto-tune (up to 3 workers)")
 
         # Cache for feed processors (lazy initialization)
         self._feed_processors = {}
@@ -214,8 +217,8 @@ class TenableIntegration:
             # Auto-tune workers if not explicitly set
             effective_workers = self.max_workers
             if effective_workers == 0:
-                # Auto-tune: use min(10, feed_count) for optimal parallelism
-                effective_workers = min(10, len(feeds_to_process))
+                # Auto-tune: use min(3, feed_count) to avoid overwhelming HEC
+                effective_workers = min(3, len(feeds_to_process))
 
             # Process feeds concurrently with auto-tuned or explicit workers
             self.logger.info(
