@@ -57,7 +57,12 @@ class TenableIntegration:
 
         # Initialize Cribl HEC handler with retry and pool settings
         # Get CA cert path (None if not set or empty)
-        ca_cert_path = os.getenv('CRIBL_HEC_CA_CERT', '').strip() or None
+        # Use expandvars to handle paths like $CRIBL_HOME/certs/ca.pem
+        ca_cert_path = os.getenv('CRIBL_HEC_CA_CERT', '').strip()
+        if ca_cert_path:
+            ca_cert_path = os.path.expandvars(os.path.expanduser(ca_cert_path))
+        else:
+            ca_cert_path = None
         
         self.cribl = CriblHECHandler(
             host=os.getenv('CRIBL_HEC_HOST'),
