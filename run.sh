@@ -6,6 +6,13 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# ============================================
+# PROXY CONFIGURATION
+# Add hostnames/IPs that should bypass proxy
+# ============================================
+export no_proxy="localhost,127.0.0.1,.company.com,cribl-server.company.com,cloud.tenable.com"
+export NO_PROXY="localhost,127.0.0.1,.company.com,cribl-server.company.com,cloud.tenable.com"
+
 # Python executable (use python3.11 explicitly)
 PYTHON_CMD="python3.11"
 
