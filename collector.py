@@ -116,8 +116,34 @@ class TenableIntegration:
         else:
             self.logger.info("Concurrent execution: auto-tune (up to 3 workers)")
 
+        # Smart feed grouping enabled by default (avoids 429 errors)
+        self.smart_grouping = os.getenv('SMART_FEED_GROUPING', 'true').lower() == 'true'
+        if self.smart_grouping:
+            self.logger.info("Smart feed grouping: ENABLED (avoids Tenable API conflicts)")
+
         # Cache for feed processors (lazy initialization)
         self._feed_processors = {}
+
+        # Feed groups by Tenable API type (only one export per type allowed)
+        # Feeds in different groups can run in parallel
+        self._feed_groups = {
+            'asset_export': [
+                'tenableio_asset',
+                'tenableio_asset_self_scan',
+                'tenableio_deleted_asset',
+                'tenableio_terminated_asset'
+            ],
+            'vuln_export': [
+                'tenableio_vulnerability',
+                'tenableio_vulnerability_no_info',
+                'tenableio_vulnerability_self_scan',
+                'tenableio_fixed_vulnerability'
+            ],
+            'rest_api': [
+                'tenableio_plugin',
+                'tenableio_compliance'
+            ]
+        }
 
     def _get_processor(self, feed_name):
         if feed_name in self._feed_processors:
@@ -174,6 +200,110 @@ class TenableIntegration:
                     feed_name, str(e)), exc_info=True)
             return 0
 
+    def _run_simple(self, feeds_to_process):
+        """Run feeds with simple concurrent/sequential processing (original behavior)."""
+        total_events = 0
+        feed_results = {}
+
+        # Auto-tune workers if not explicitly set
+        effective_workers = self.max_workers
+        if effective_workers == 0:
+            effective_workers = min(3, len(feeds_to_process))
+
+        self.logger.info(
+            "SIMPLE MODE: Processing {0} feeds with {1} workers".format(
+                len(feeds_to_process), effective_workers))
+
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+            future_to_feed = {
+                executor.submit(self._process_feed, feed_name): feed_name
+                for feed_name in feeds_to_process
+            }
+
+            completed = 0
+            for future in as_completed(future_to_feed):
+                feed_name = future_to_feed[future]
+                completed += 1
+                try:
+                    event_count = future.result()
+                    total_events += event_count
+                    feed_results[feed_name] = event_count
+                    self.logger.info(
+                        "Feed {0} completed: {1} events ({2}/{3} done)".format(
+                            feed_name, event_count, completed, len(feeds_to_process)))
+                except Exception as e:
+                    self.logger.error("Feed {0} FAILED: {1}".format(feed_name, str(e)))
+                    feed_results[feed_name] = 0
+
+        return total_events, feed_results
+
+    def _run_with_smart_grouping(self, feeds_to_process):
+        """
+        Run feeds with smart grouping to avoid Tenable API conflicts.
+        
+        Strategy:
+        - Feeds within the same API group run SEQUENTIALLY (to avoid 429 errors)
+        - Different API groups can run IN PARALLEL (asset + vuln + rest_api)
+        
+        This allows up to 3 concurrent exports without conflicts:
+        - 1 asset export + 1 vuln export + REST API calls
+        """
+        total_events = 0
+        feed_results = {}
+
+        # Organize feeds into their API groups
+        grouped_feeds = {'asset_export': [], 'vuln_export': [], 'rest_api': []}
+        for feed in feeds_to_process:
+            for group_name, group_feeds in self._feed_groups.items():
+                if feed in group_feeds:
+                    grouped_feeds[group_name].append(feed)
+                    break
+
+        # Remove empty groups
+        active_groups = {k: v for k, v in grouped_feeds.items() if v}
+
+        self.logger.info("=" * 60)
+        self.logger.info("SMART GROUPING MODE: Avoiding Tenable API conflicts")
+        self.logger.info("=" * 60)
+        for group_name, feeds in active_groups.items():
+            self.logger.info("  {0}: {1}".format(group_name, ', '.join(feeds)))
+        self.logger.info("=" * 60)
+
+        def process_group_sequentially(group_name, feeds):
+            """Process all feeds in a group one at a time."""
+            group_events = 0
+            group_results = {}
+            for feed in feeds:
+                if self._shutdown_event.is_set():
+                    break
+                self.logger.info("[{0}] Processing: {1}".format(group_name, feed))
+                event_count = self._process_feed(feed)
+                group_events += event_count
+                group_results[feed] = event_count
+                self.logger.info("[{0}] Completed: {1} ({2} events)".format(
+                    group_name, feed, event_count))
+            return group_events, group_results
+
+        # Run groups in parallel, but feeds within each group run sequentially
+        with ThreadPoolExecutor(max_workers=len(active_groups)) as executor:
+            future_to_group = {
+                executor.submit(process_group_sequentially, group_name, feeds): group_name
+                for group_name, feeds in active_groups.items()
+            }
+
+            for future in as_completed(future_to_group):
+                group_name = future_to_group[future]
+                try:
+                    group_events, group_results = future.result()
+                    total_events += group_events
+                    feed_results.update(group_results)
+                    self.logger.info("Group [{0}] completed: {1} total events".format(
+                        group_name, group_events))
+                except Exception as e:
+                    self.logger.error("Group [{0}] FAILED: {1}".format(group_name, str(e)))
+
+        return total_events, feed_results
+
     def run_once(self, data_types):
         # Run collection once for specified feed types
         # Note: No process lock needed - each feed uses separate checkpoint
@@ -214,46 +344,12 @@ class TenableIntegration:
             total_events = 0
             feed_results = {}
 
-            # Auto-tune workers if not explicitly set
-            effective_workers = self.max_workers
-            if effective_workers == 0:
-                # Auto-tune: use min(3, feed_count) to avoid overwhelming HEC
-                effective_workers = min(3, len(feeds_to_process))
-
-            # Process feeds concurrently with auto-tuned or explicit workers
-            self.logger.info(
-                "CONCURRENT MODE: Processing {0} feeds with {1} workers".format(
-                    len(feeds_to_process), effective_workers))
-            self.logger.info(
-                "Feeds queued: {0}".format(
-                    ', '.join(feeds_to_process)))
-
-            with ThreadPoolExecutor(max_workers=effective_workers) as executor:
-                # Submit all feed processing jobs
-                future_to_feed = {
-                    executor.submit(self._process_feed, feed_name): feed_name
-                    for feed_name in feeds_to_process
-                }
-
-                self.logger.info(
-                    "All {0} feeds submitted to thread pool".format(len(feeds_to_process)))
-                completed = 0
-
-                # Collect results as they complete
-                for future in as_completed(future_to_feed):
-                    feed_name = future_to_feed[future]
-                    completed += 1
-                    try:
-                        event_count = future.result()
-                        total_events += event_count
-                        feed_results[feed_name] = event_count
-                        self.logger.info(
-                            "Feed {0} completed: {1} events ({2}/{3} done)".format(
-                                feed_name, event_count, completed, len(feeds_to_process)))
-                    except Exception as e:
-                        self.logger.error("Feed {0} FAILED: {1} ({2}/{3} done)".format(
-                            feed_name, str(e), completed, len(feeds_to_process)), exc_info=True)
-                        feed_results[feed_name] = 0
+            # Use smart grouping to avoid Tenable API conflicts (429 errors)
+            if self.smart_grouping and len(feeds_to_process) > 1:
+                total_events, feed_results = self._run_with_smart_grouping(feeds_to_process)
+            else:
+                # Original behavior: simple concurrent/sequential processing
+                total_events, feed_results = self._run_simple(feeds_to_process)
 
             self.logger.info("=" * 80)
             self.logger.info("INTEGRATION COMPLETED SUCCESSFULLY")
