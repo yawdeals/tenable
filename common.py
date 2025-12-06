@@ -124,7 +124,8 @@ class CriblHECHandler:
                  sourcetype, source, ssl_verify=True,
                  ssl_ca_cert=None,
                  max_retries=None, backoff_factor=None,
-                 pool_connections=None, pool_maxsize=None):
+                 pool_connections=None, pool_maxsize=None,
+                 batch_delay=None, request_timeout=None):
         # Initialize HEC client with connection parameters
         self.hec_handler = hec.http_event_collector(
             token=token,
@@ -136,7 +137,9 @@ class CriblHECHandler:
             max_retries=max_retries,
             backoff_factor=backoff_factor,
             pool_connections=pool_connections,
-            pool_maxsize=pool_maxsize
+            pool_maxsize=pool_maxsize,
+            batch_delay=batch_delay,
+            request_timeout=request_timeout
         )
         self.sourcetype = sourcetype
         self.source = source
