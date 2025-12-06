@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Splunk/Cribl HTTP Event Collector (HEC) Python Library
+Splunk HTTP Event Collector (HEC) Python Library
 Based on georgestarcher's Splunk-Class-httpevent
 https://github.com/georgestarcher/Splunk-Class-httpevent
 
@@ -16,17 +16,19 @@ from urllib3.util.retry import Retry
 import json
 import time
 import socket
+import os
 import logging
+from datetime import datetime
 
 
 class http_event_collector:
     """
-    Splunk/Cribl HTTP Event Collector class for sending events
+    Splunk HTTP Event Collector class for sending events to Splunk
     """
 
     # Default retry configuration
     DEFAULT_MAX_RETRIES = 3
-    DEFAULT_BACKOFF_FACTOR = 1.0
+    DEFAULT_BACKOFF_FACTOR = 1.0  # 1s, 2s, 4s with exponential backoff
     DEFAULT_RETRY_STATUS_CODES = [429, 500, 502, 503, 504]
 
     # Default connection pool configuration
@@ -40,6 +42,7 @@ class http_event_collector:
             host="",
             http_event_port='8088',
             http_event_server_ssl=True,
+            ssl_ca_cert=None,
             max_bytes=1048576,
             index="",
             max_retries=None,
@@ -50,22 +53,26 @@ class http_event_collector:
         Initialize HEC event collector
 
         Args:
-            token: HEC token from Splunk/Cribl
-            http_event_server: Server hostname/IP
+            token: HEC token from Splunk
+            http_event_server: Splunk server hostname/IP
             host: Host field for events (default: current hostname)
             http_event_port: HEC port (default: 8088)
             http_event_server_ssl: Use SSL/TLS (default: True)
             max_bytes: Maximum batch size in bytes (default: 1MB)
-            index: Default index
+            index: Default Splunk index
             max_retries: Maximum retry attempts (default: 3)
             backoff_factor: Exponential backoff factor in seconds (default: 1.0)
             pool_connections: Number of connection pools (default: 10)
             pool_maxsize: Max connections per pool (default: 10)
+            ssl_ca_cert: Path to CA certificate file for SSL verification (default: None)
         """
         self.token = token
+        self.ssl_ca_cert = ssl_ca_cert
+        self.ssl_verify = http_event_server_ssl
         self.batchEvents = []
         self.maxByteLength = max_bytes
         self.currentByteLength = 0
+        self.server_uri = []
 
         # Retry configuration
         self.max_retries = max_retries if max_retries is not None else self.DEFAULT_MAX_RETRIES
@@ -81,13 +88,20 @@ class http_event_collector:
         self.error_count = 0
 
         # Set server protocol
-        protocol = 'https' if http_event_server_ssl else 'http'
+        if http_event_server_ssl:
+            protocol = 'https'
+        else:
+            protocol = 'http'
 
         # Build server URI
         self.server_uri = f'{protocol}://{http_event_server}:{http_event_port}/services/collector/event'
 
         # Set default host if not provided
-        self.host = host if host else socket.gethostname()
+        if host:
+            self.host = host
+        else:
+            self.host = socket.gethostname()
+
         self.index = index
 
         # Logger for this module
@@ -97,7 +111,15 @@ class http_event_collector:
         self._session = self._create_session(http_event_server_ssl)
 
     def _create_session(self, ssl_enabled):
-        """Create a requests session with connection pooling and retry strategy."""
+        """
+        Create a requests session with connection pooling and retry strategy.
+
+        Args:
+            ssl_enabled: Whether SSL is enabled (for warning suppression)
+
+        Returns:
+            Configured requests.Session object
+        """
         session = requests.Session()
 
         # Configure retry strategy with exponential backoff
@@ -105,8 +127,8 @@ class http_event_collector:
             total=self.max_retries,
             backoff_factor=self.backoff_factor,
             status_forcelist=self.DEFAULT_RETRY_STATUS_CODES,
-            allowed_methods=["POST"],
-            raise_on_status=False
+            allowed_methods=["POST"],  # Only retry POST requests
+            raise_on_status=False  # Don't raise, we handle status ourselves
         )
 
         # Configure HTTP adapter with connection pooling
@@ -144,8 +166,9 @@ class http_event_collector:
         # Handle event time
         if eventtime:
             payload['time'] = eventtime
-        elif 'time' not in payload:
-            payload['time'] = str(int(time.time()))
+        else:
+            if 'time' not in payload:
+                payload['time'] = str(int(time.time()))
 
         # Convert payload to JSON
         payloadString = json.dumps(payload)
@@ -160,7 +183,9 @@ class http_event_collector:
         self.currentByteLength += payloadLength
 
     def flushBatch(self):
-        """Flush the current batch of events with retry logic."""
+        """
+        Flush the current batch of events to Splunk with retry logic.
+        """
         if len(self.batchEvents) == 0:
             return
 
@@ -174,24 +199,35 @@ class http_event_collector:
             'Content-Type': 'application/json'
         }
 
+        # Send via persistent session with connection pooling
+        # Retry strategy is built into the session adapter
         last_error = None
         for attempt in range(self.max_retries + 1):
             try:
+                # Determine SSL verification setting
+                if self.ssl_verify:
+                    verify_param = self.ssl_ca_cert if self.ssl_ca_cert else True
+                else:
+                    verify_param = False
+
                 response = self._session.post(
                     self.server_uri,
                     data=payload,
                     headers=headers,
-                    verify=False,
+                    verify=verify_param,
                     proxies={'http': None, 'https': None},
-                    timeout=30
+                    timeout=30  # Add timeout for better reliability
                 )
 
+                # Check response
                 if response.status_code == 200:
                     self.send_count += event_count
+                    # Reset batch on success
                     self.batchEvents = []
                     self.currentByteLength = 0
                     return response
 
+                # Handle specific error codes
                 if response.status_code in self.DEFAULT_RETRY_STATUS_CODES:
                     self.retry_count += 1
                     wait_time = self.backoff_factor * (2 ** attempt)
@@ -204,7 +240,9 @@ class http_event_collector:
 
                 # Non-retryable error
                 self.error_count += 1
-                self.logger.error(f"HEC error: {response.status_code} - {response.text}")
+                self.logger.error(
+                    f"HEC Event Collector error: {response.status_code} - {response.text}")
+                # Reset batch even on error to prevent stuck data
                 self.batchEvents = []
                 self.currentByteLength = 0
                 return response
@@ -213,40 +251,141 @@ class http_event_collector:
                 self.retry_count += 1
                 last_error = "Request timeout"
                 wait_time = self.backoff_factor * (2 ** attempt)
-                self.logger.warning(f"HEC timeout, retrying in {wait_time:.1f}s")
+                self.logger.warning(
+                    f"HEC request timeout, retrying in {wait_time:.1f}s "
+                    f"(attempt {attempt + 1}/{self.max_retries + 1})"
+                )
                 time.sleep(wait_time)
 
             except requests.exceptions.ConnectionError as e:
                 self.retry_count += 1
                 last_error = str(e)
                 wait_time = self.backoff_factor * (2 ** attempt)
-                self.logger.warning(f"HEC connection error, retrying in {wait_time:.1f}s: {e}")
+                self.logger.warning(
+                    f"HEC connection error, retrying in {wait_time:.1f}s "
+                    f"(attempt {attempt + 1}/{self.max_retries + 1}): {e}"
+                )
                 time.sleep(wait_time)
 
             except Exception as e:
                 self.error_count += 1
-                self.logger.error(f"HEC exception: {e}")
+                self.logger.error(f"HEC Event Collector exception: {e}")
+                # Reset batch on exception
                 self.batchEvents = []
                 self.currentByteLength = 0
                 raise
 
         # All retries exhausted
         self.error_count += 1
-        self.logger.error(f"HEC failed after {self.max_retries + 1} attempts: {last_error}")
+        self.logger.error(
+            f"HEC request failed after {self.max_retries + 1} attempts: {last_error}")
+        # Reset batch to prevent stuck state
         self.batchEvents = []
         self.currentByteLength = 0
 
+    def __del__(self):
+        """
+        Destructor - flush any remaining events
+        """
+        try:
+            self.flushBatch()
+        except BaseException:
+            pass
+
     def get_metrics(self):
-        """Get current metrics for monitoring."""
+        """
+        Get current metrics for monitoring.
+
+        Returns:
+            dict with send_count, retry_count, error_count
+        """
         return {
             'send_count': self.send_count,
             'retry_count': self.retry_count,
             'error_count': self.error_count
         }
 
-    def __del__(self):
-        """Destructor - flush any remaining events"""
+
+class http_event_collector_raw:
+    """
+    Splunk HTTP Event Collector class for raw endpoint
+    """
+
+    def __init__(self, token, http_event_server, http_event_port='8088',
+                 http_event_server_ssl=True, channel=""):
+        """
+        Initialize HEC raw event collector
+
+        Args:
+            token: HEC token from Splunk
+            http_event_server: Splunk server hostname/IP
+            http_event_port: HEC port (default: 8088)
+            http_event_server_ssl: Use SSL/TLS (default: True)
+            channel: HEC channel GUID
+        """
+        self.token = token
+        self.channel = channel
+
+        # Set server protocol
+        if http_event_server_ssl:
+            protocol = 'https'
+        else:
+            protocol = 'http'
+
+        # Build server URI
+        self.server_uri = f'{protocol}://{http_event_server}:{http_event_port}/services/collector/raw'
+
+        # Disable SSL warnings if not verifying
+        if not http_event_server_ssl:
+            requests.packages.urllib3.disable_warnings()
+
+    def sendEvent(self, payload, source="", sourcetype="", index="", host=""):
+        """
+        Send raw event to Splunk
+
+        Args:
+            payload: Raw event data
+            source: Event source
+            sourcetype: Event sourcetype
+            index: Splunk index
+            host: Event host
+        """
+        # Prepare headers
+        headers = {
+            'Authorization': f'Splunk {self.token}'
+        }
+
+        if self.channel:
+            headers['X-Splunk-Request-Channel'] = self.channel
+
+        # Prepare query parameters
+        params = {}
+        if source:
+            params['source'] = source
+        if sourcetype:
+            params['sourcetype'] = sourcetype
+        if index:
+            params['index'] = index
+        if host:
+            params['host'] = host
+
+        # Send to Splunk
         try:
-            self.flushBatch()
-        except Exception:
-            pass
+            response = requests.post(
+                self.server_uri,
+                params=params,
+                data=payload,
+                headers=headers,
+                verify=False  # Consider making this configurable
+            )
+
+            # Check response
+            if response.status_code != 200:
+                print(
+                    f"HEC Raw Event Collector error: {response.status_code} - {response.text}")
+
+            return response
+
+        except Exception as e:
+            print(f"HEC Raw Event Collector exception: {e}")
+            raise
