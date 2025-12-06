@@ -32,8 +32,12 @@ class http_event_collector:
     DEFAULT_RETRY_STATUS_CODES = [429, 500, 502, 503, 504]
 
     # Default connection pool configuration
-    DEFAULT_POOL_CONNECTIONS = 10
-    DEFAULT_POOL_MAXSIZE = 10
+    DEFAULT_POOL_CONNECTIONS = 3
+    DEFAULT_POOL_MAXSIZE = 3
+
+    # Rate limiting defaults (to prevent overwhelming HEC)
+    DEFAULT_BATCH_DELAY = 0.2  # 200ms delay between batches
+    DEFAULT_REQUEST_TIMEOUT = 90  # Increased timeout for large batches
 
     def __init__(
             self,
@@ -48,7 +52,9 @@ class http_event_collector:
             max_retries=None,
             backoff_factor=None,
             pool_connections=None,
-            pool_maxsize=None):
+            pool_maxsize=None,
+            batch_delay=None,
+            request_timeout=None):
         """
         Initialize HEC event collector
 
@@ -62,9 +68,11 @@ class http_event_collector:
             index: Default Splunk index
             max_retries: Maximum retry attempts (default: 3)
             backoff_factor: Exponential backoff factor in seconds (default: 1.0)
-            pool_connections: Number of connection pools (default: 10)
-            pool_maxsize: Max connections per pool (default: 10)
+            pool_connections: Number of connection pools (default: 5)
+            pool_maxsize: Max connections per pool (default: 5)
             ssl_ca_cert: Path to CA certificate file for SSL verification (default: None)
+            batch_delay: Delay between batches in seconds (default: 0.1)
+            request_timeout: Request timeout in seconds (default: 60)
         """
         self.token = token
         self.ssl_ca_cert = ssl_ca_cert
@@ -81,6 +89,10 @@ class http_event_collector:
         # Connection pool configuration
         self.pool_connections = pool_connections if pool_connections is not None else self.DEFAULT_POOL_CONNECTIONS
         self.pool_maxsize = pool_maxsize if pool_maxsize is not None else self.DEFAULT_POOL_MAXSIZE
+
+        # Rate limiting configuration
+        self.batch_delay = batch_delay if batch_delay is not None else self.DEFAULT_BATCH_DELAY
+        self.request_timeout = request_timeout if request_timeout is not None else self.DEFAULT_REQUEST_TIMEOUT
 
         # Metrics tracking
         self.retry_count = 0
@@ -216,7 +228,7 @@ class http_event_collector:
                     headers=headers,
                     verify=verify_param,
                     proxies={'http': None, 'https': None},
-                    timeout=30  # Add timeout for better reliability
+                    timeout=self.request_timeout
                 )
 
                 # Check response
@@ -225,6 +237,9 @@ class http_event_collector:
                     # Reset batch on success
                     self.batchEvents = []
                     self.currentByteLength = 0
+                    # Rate limiting: small delay between batches to avoid overwhelming HEC
+                    if self.batch_delay > 0:
+                        time.sleep(self.batch_delay)
                     return response
 
                 # Handle specific error codes
